@@ -81,6 +81,21 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
+    # ---- Optimization techniques from research report ----
+    # SmearGate: blend previous token embedding (~512 params)
+    smear_gate: bool = bool(int(os.environ.get("SMEAR_GATE", "0")))
+    # BigramHash: hash table for token pairs (n-gram statistics)
+    bigram_hash_buckets: int = int(os.environ.get("BIGRAM_HASH_BUCKETS", "0"))
+    bigram_hash_dim: int = int(os.environ.get("BIGRAM_HASH_DIM", "128"))
+    # Partial RoPE: apply RoPE to only portion of head dims (zero params)
+    partial_rope_dims: int = int(os.environ.get("PARTIAL_ROPE_DIMS", "0"))
+    # LN Scale: 1/sqrt(layer+1) depth stabilization (zero params)
+    ln_scale: bool = bool(int(os.environ.get("LN_SCALE", "0")))
+    # Value Residual: blend v0 into subsequent layers (~22 params)
+    value_residual: bool = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    # Shared Value Embedding: tie V projections across layer pairs
+    shared_value_embed_pairs: str = os.environ.get("SHARED_VALUE_EMBED_PAIRS", "")
+
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -124,7 +139,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,v_residual_gate,v_residual_scale,smear_gate_param",
     ).split(",")
     if pattern
 )
@@ -292,11 +307,39 @@ class RMSNormNoWeight(nn.Module):
         return rms_norm(x)
 
 
+class BigramHashEmbedding(nn.Module):
+    """BigramHash: hash table for consecutive token pairs to capture n-gram statistics.
+    
+    Maps consecutive token pairs through a hash table into a learned embedding,
+    which is projected to model dimension. This provides n-gram statistics
+    that the small vocabulary loses.
+    
+    Reference: PR #164 - contributed ~-0.01 BPB
+    """
+    def __init__(self, vocab_size: int, num_buckets: int, proj_dim: int, model_dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_buckets = num_buckets
+        self.embed = nn.Embedding(num_buckets, proj_dim)
+        self.proj = CastedLinear(proj_dim, model_dim)
+        self.proj.weight = mx.zeros_like(self.proj.weight)
+    
+    def _hash_pair(self, tok1: mx.array, tok2: mx.array) -> mx.array:
+        combined = tok1 * mx.array(self.vocab_size, dtype=mx.int32) + tok2
+        return mx.abs(combined) % self.num_buckets
+    
+    def __call__(self, tok1: mx.array, tok2: mx.array) -> mx.array:
+        buckets = self._hash_pair(tok1, tok2)
+        embedded = self.embed(buckets)
+        return self.proj(embedded)
+
+
 class CausalSelfAttention(nn.Module):
     # - separate q/k/v projections
     # - RMSNorm on q and k before attention
-    # - RoPE on q and k
+    # - RoPE on q and k (supports Partial RoPE)
     # - causal masked SDPA
+    # - Value Residual support
     def __init__(
         self,
         dim: int,
@@ -304,6 +347,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        partial_rope_dims: int = 0,
+        has_value_residual: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -313,6 +358,7 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.partial_rope_dims = partial_rope_dims
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
@@ -322,19 +368,45 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        if partial_rope_dims > 0 and partial_rope_dims < self.head_dim:
+            self.rope_partial = nn.RoPE(partial_rope_dims, traditional=False, base=rope_base)
+        else:
+            self.rope_partial = None
         self.scale = self.head_dim ** -0.5
+        
+        self.has_value_residual = has_value_residual
+        if has_value_residual:
+            self.v_residual_gate = mx.ones((dim,), dtype=mx.float32)
+            self.v_residual_scale = mx.zeros((dim,), dtype=mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, v0: mx.array | None = None) -> tuple[mx.array, mx.array]:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = rms_norm(q).astype(COMPUTE_DTYPE)
+        k = rms_norm(k).astype(COMPUTE_DTYPE)
+        
+        if self.partial_rope_dims > 0 and self.partial_rope_dims < self.head_dim and self.rope_partial is not None:
+            q_rope, q_pass = q[..., :self.partial_rope_dims], q[..., self.partial_rope_dims:]
+            k_rope, k_pass = k[..., :self.partial_rope_dims], k[..., self.partial_rope_dims:]
+            q_rope = self.rope_partial(q_rope)
+            k_rope = self.rope_partial(k_rope)
+            q = mx.concatenate([q_rope, q_pass], axis=-1)
+            k = mx.concatenate([k_rope, k_pass], axis=-1)
+        else:
+            q = self.rope(q)
+            k = self.rope(k)
+        
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+        
+        if self.has_value_residual and v0 is not None:
+            y = self.v_residual_gate.astype(y.dtype) * y + \
+                self.v_residual_scale.astype(y.dtype) * v0
+        
         return self.proj(y)
 
 
@@ -360,22 +432,38 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        layer_idx: int = 0,
+        partial_rope_dims: int = 0,
+        has_value_residual: bool = False,
+        ln_scale: bool = False,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.ln_scale = ln_scale
+        self.dim = dim
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+            partial_rope_dims=partial_rope_dims,
+            has_value_residual=has_value_residual,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, v0: mx.array | None = None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        
+        ln_scale_factor = mx.array(1.0, dtype=mx.float32)
+        if self.ln_scale:
+            ln_scale_factor = mx.array(1.0 / np.sqrt(self.layer_idx + 1), dtype=mx.float32)
+        
+        attn_out = self.attn(self.attn_norm(x), v0)
+        x = x + (ln_scale_factor.astype(x.dtype) * self.attn_scale.astype(x.dtype))[None, None, :] * attn_out
+        x = x + (ln_scale_factor.astype(x.dtype) * self.mlp_scale.astype(x.dtype))[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -384,9 +472,27 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    # - Optional: SmearGate, BigramHash, Partial RoPE, LN Scale, Value Residual
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        logit_chunk_tokens: int,
+        logit_softcap: float,
+        rope_base: float,
+        tied_embed_init_std: float,
+        qk_gain_init: float,
+        smear_gate: bool = False,
+        bigram_hash_buckets: int = 0,
+        bigram_hash_dim: int = 128,
+        partial_rope_dims: int = 0,
+        ln_scale: bool = False,
+        value_residual: bool = False,
+    ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -398,11 +504,29 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        
+        self.smear_gate = smear_gate
+        self.bigram_hash_buckets = bigram_hash_buckets
+        self.bigram_hash = None
+        if bigram_hash_buckets > 0:
+            self.bigram_hash = BigramHashEmbedding(vocab_size, bigram_hash_buckets, bigram_hash_dim, dim)
+        
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(
+                dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                layer_idx=i,
+                partial_rope_dims=partial_rope_dims,
+                has_value_residual=value_residual and i > 0,
+                ln_scale=ln_scale,
+            )
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        
+        if smear_gate:
+            self.smear_proj = CastedLinear(dim, dim)
+            self.smear_proj.weight = mx.zeros_like(self.smear_proj.weight)
+            self.smear_gate_param = mx.ones((dim,), dtype=mx.float32) * 0.5
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -416,20 +540,34 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        
+        if self.smear_gate and input_ids.shape[1] > 1:
+            prev_emb = self.tok_emb(input_ids[:, :-1]).astype(COMPUTE_DTYPE)
+            smeared = self.smear_proj(prev_emb)
+            smeared_normed = rms_norm(smeared)
+            gate = self.smear_gate_param.astype(x.dtype)
+            x = x + mx.concatenate([mx.zeros((1, 1, x.shape[-1]), dtype=x.dtype), gate.reshape(1, 1, -1) * smeared_normed], axis=1)
+        
+        if self.bigram_hash is not None:
+            bigram_emb = self.bigram_hash(input_ids[:, :-1], input_ids[:, 1:])
+            x = x + mx.concatenate([mx.zeros((1, 1, x.shape[-1]), dtype=x.dtype), bigram_emb], axis=1)
+        
+        x = rms_norm(x)
         x0 = x
         skips: list[mx.array] = []
+        
+        v0_cache: mx.array | None = None
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, v0_cache)
+            if i == 0:
+                v0_cache = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, v0_cache)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -897,6 +1035,12 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        smear_gate=args.smear_gate,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
+        partial_rope_dims=args.partial_rope_dims,
+        ln_scale=args.ln_scale,
+        value_residual=args.value_residual,
     )
     opt = SplitOptimizers(model, args)
 
