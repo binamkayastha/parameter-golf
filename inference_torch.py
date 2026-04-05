@@ -294,7 +294,6 @@ def sample_top_p(logits: torch.Tensor, p: float = 0.9) -> int:
 
 def generate(model, sp, prompt: str, max_tokens: int = 100, temp: float = 0.0, top_p: float = 0.0):
     tokens = np.array(sp.encode(prompt), dtype=np.int64)
-    print(f"DEBUG: prompt='{prompt}', tokens={tokens}")
     x = torch.tensor(tokens.reshape(1, -1), dtype=torch.long)
     
     for i in range(max_tokens):
