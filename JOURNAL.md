@@ -9,7 +9,10 @@ A running log of the team's experiments, milestones, and learnings.
   - [AI-Assisted Inference](#ai-assisted-inference)
   - [Second Run — Research-Guided Optimization](#second-run--research-guided-optimization)
   - [First GPU Run — Baseline on Sean's Runpod](#first-gpu-run--baseline-on-seans-runpod)
-  - [Inference Portability — In Progress](#inference-portability--in-progress)
+  - [Full Local MLX Run — Smear Gate + Bigram Hash](#full-local-mlx-run--smear-gate--bigram-hash)
+  - [Inference Portability — PyTorch Script + Debugging](#inference-portability--pytorch-script--debugging)
+  - [Repeating Output & Next Training Run](#repeating-output--next-training-run)
+  - [K's First GPU Run — Runpod Baseline](#ks-first-gpu-run--runpod-baseline)
 
 ---
 
@@ -63,14 +66,75 @@ The results put everything in perspective: the baseline on a proper GPU scored *
 
 With that context, BK identified the correct local training command (smear gate + bigram hash features enabled) and kicked off a proper full local run on Apple Silicon.
 
-### Inference Portability — In Progress
+### Full Local MLX Run — Smear Gate + Bigram Hash
 
-The existing `inference_mlx.py` only supports MLX checkpoints. To test the GPU baseline model on Sean's Runpod, BK is extending the inference script to handle standard PyTorch checkpoints. Results pending.
+BK ran a proper full local training job with smear gate and bigram hash features enabled. The model came out worse than every prior run — **val_bpb 6.297** — and the inference output confirmed it: greedy decoding just repeats the last character or token indefinitely. Something in the feature configuration or the LLM-applied optimizations is broken for the local setup.
+
+| Metric | Value |
+|---|---|
+| val_loss | 10.6326 |
+| val_bpb | 6.2972 |
+| Eval time | ~7 min |
+| Parameters | 17,912,392 (~18M) |
+
+The 18M parameter count is notable — much smaller than the smoke test model (80M). The LLM-applied changes likely altered the architecture in ways that introduced a configuration mismatch, or the feature flags interact badly with the current hyperparameters.
+
+### Inference Portability — PyTorch Script + Debugging
+
+BK wrote `inference_torch.py` to load PyTorch checkpoints from the GPU training runs. Getting it running required several rounds of LLM-assisted debugging on Runpod:
+
+- First error: missing tokenizer file — needed to manually copy `fineweb_1024_bpe.model` into the expected path
+- Once loading worked, the script ran but produced no new tokens — every prompt just echoed back verbatim
+- BK's LLM traced a tensor shape mismatch deep in the `Block` forward pass: `resid_mix` (a `[2, 512]` parameter) was being indexed incorrectly, causing a broadcast failure at the residual mixing step. The fix involved correcting the indexing from treating `resid_mix` like a Python tuple to using proper tensor slicing
+- Rather than patch `inference_torch.py` further, BK had the LLM write a fresh script (`inference_fresh.py`) from scratch
+
+With the new script, the GPU model produced its first real output: *"Once upon a time, the city is a slightly different, and the city is a slightly different..."* — repetitive but structurally coherent, unlike the MLX smoke-test results.
+
+BK also wired up the LLM to issue commands directly inside a tmux session on Runpod so it could observe and iterate in real time.
+
+### Repeating Output & Next Training Run
+
+Even with temperature raised to 2.0, the GPU baseline model still loops. The LLM's diagnosis: greedy decoding amplifies any bias toward high-frequency tokens, and the baseline model simply hasn't seen enough data to learn strong contextual conditioning.
+
+BK kicked off a longer GPU training run with the official sp1024 dataset and tokenizer:
+
+```
+RUN_ID=optimized_sp1024
+DATA_PATH=./data/datasets/fineweb10B_sp1024/
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model
+VOCAB_SIZE=1024
+TRAIN_BATCH_TOKENS=131072
+ITERATIONS=5000
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+```
+
+Results pending.
+
+### K's First GPU Run — Runpod Baseline
+
+K ran their first GPU training job on a Runpod instance. Used a Claude-generated shell script to make launching the run easier. Training hit the wallclock cap at step 683/20000 (~10 minutes).
+
+| Metric | Value |
+|---|---|
+| val_loss | 2.3728 |
+| val_bpb | 1.4053 |
+| Steps completed | 683 / 20,000 |
+| Train time | 600,344 ms (~10 min) |
+| Step avg | 878.98 ms |
+| Peak memory | 10,317 MiB allocated / 10,574 MiB reserved |
+| Model size (int8+zlib) | ~11.1 MB |
+| Eval time | 30,096 ms |
+| final_int8_zlib val_bpb | 1.4103 |
+
+val_bpb of 1.4053 beats BK's earlier GPU baseline (1.561), suggesting the run configuration may already be better-tuned. Stopped early due to wallclock cap — a full run could push the score lower.
 
 ### TODO
 
 - [x] Run a real training job (more iterations, proper hyperparameters)
-- [ ] Complete PyTorch inference support and test baseline model on Runpod
-- [ ] Get results from the full local MLX run (smear gate + bigram hash) and compare to GPU baseline (1.561)
+- [x] Get results from the full local MLX run (smear gate + bigram hash) — val_bpb 6.297, regression
+- [ ] Diagnose the regression: why did enabling smear gate + bigram hash make things worse? (architecture mismatch? LLM-applied changes broke something?)
+- [x] Complete PyTorch inference support and test the GPU baseline model on Runpod — works via `inference_fresh.py`; baseline model repeats but generates tokens
+- [ ] Run the official repo-recommended command on Runpod (`RUN_ID=baseline_sp1024` with 1024-vocab tokenizer) and compare to Sean's baseline (1.561)
+- [ ] Port research-guided optimizations from `train_gpt_mlx.py` to `train_gpt.py` for GPU and benchmark
 - [ ] Identify which specific optimizations from the research report were applied
 - [ ] Try inference with temperature / top-p to see if output diversity improves
