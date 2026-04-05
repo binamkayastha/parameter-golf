@@ -312,7 +312,8 @@ def generate(model, sp, prompt: str, max_tokens: int = 100, temp: float = 0.0, t
             next_token = torch.argmax(next_token_logits).item()
         
         if i < 3:
-            print(f"DEBUG: step {i}, next_token={next_token}, top5 logits={torch.topk(next_token_logits, 5)}")
+            k = min(5, next_token_logits.numel())
+            print(f"DEBUG: step {i}, next_token={next_token}, top{k} logits={torch.topk(next_token_logits, k)}")
         
         if next_token == sp.eos_id():
             print(f"DEBUG: EOS token hit at step {i}")
