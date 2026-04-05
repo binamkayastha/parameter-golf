@@ -63,6 +63,18 @@ def load_model_torch(model_path: str, args):
     )
     
     model.load_state_dict(state_dict, strict=False)
+    
+    # Debug: check key mismatches
+    model_keys = set(model.state_dict().keys())
+    loaded_keys = set(state_dict.keys())
+    missing = model_keys - loaded_keys
+    unexpected = loaded_keys - model_keys
+    if missing:
+        print(f"DEBUG: Missing keys (in model but not loaded): {missing}")
+    if unexpected:
+        print(f"DEBUG: Unexpected keys (loaded but not in model): {len(unexpected)} keys")
+    print(f"DEBUG: Loaded {len(loaded_keys & model_keys)}/{len(model_keys)} keys")
+    
     model.eval()
     return model
 
@@ -294,6 +306,7 @@ def sample_top_p(logits: torch.Tensor, p: float = 0.9) -> int:
 
 def generate(model, sp, prompt: str, max_tokens: int = 100, temp: float = 0.0, top_p: float = 0.0):
     tokens = np.array(sp.encode(prompt), dtype=np.int64)
+    print(f"DEBUG: prompt='{prompt}', tokens={tokens}")
     x = torch.tensor(tokens.reshape(1, -1), dtype=torch.long)
     
     for i in range(max_tokens):
