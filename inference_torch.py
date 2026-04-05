@@ -63,18 +63,6 @@ def load_model_torch(model_path: str, args):
     )
     
     model.load_state_dict(state_dict, strict=False)
-    
-    # Debug: check key mismatches
-    model_keys = set(model.state_dict().keys())
-    loaded_keys = set(state_dict.keys())
-    missing = model_keys - loaded_keys
-    unexpected = loaded_keys - model_keys
-    if missing:
-        print(f"DEBUG: Missing keys (in model but not loaded): {missing}")
-    if unexpected:
-        print(f"DEBUG: Unexpected keys (loaded but not in model): {len(unexpected)} keys")
-    print(f"DEBUG: Loaded {len(loaded_keys & model_keys)}/{len(model_keys)} keys")
-    
     model.eval()
     return model
 
@@ -191,13 +179,13 @@ class RotaryEmbedding(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.base = base
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        self._inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         seq_len = x.shape[2]
-        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+        inv_freq = self._inv_freq.to(device=x.device, dtype=x.dtype)
+        t = torch.arange(seq_len, device=x.device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos()
         sin = emb.sin()
@@ -324,12 +312,7 @@ def generate(model, sp, prompt: str, max_tokens: int = 100, temp: float = 0.0, t
         else:
             next_token = torch.argmax(next_token_logits).item()
         
-        if i < 3:
-            k = min(5, next_token_logits.numel())
-            print(f"DEBUG: step {i}, next_token={next_token}, top{k} logits={torch.topk(next_token_logits, k)}")
-        
         if next_token == sp.eos_id():
-            print(f"DEBUG: EOS token hit at step {i}")
             break
         
         x = torch.cat([x, torch.tensor([[next_token]], dtype=torch.long)], dim=1)
