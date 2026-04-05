@@ -150,7 +150,14 @@ class CausalSelfAttention(nn.Module):
         k = self.rope(k)
         q = q * self.q_gain[None, :, None, None]
         
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True, scale=self.scale)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=self.scale,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
         y = y.transpose(1, 2).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
