@@ -547,11 +547,13 @@ class GPT(nn.Module):
             smeared = self.smear_proj(prev_emb)
             smeared_normed = rms_norm(smeared)
             gate = self.smear_gate_param.astype(x.dtype)
-            x = x + mx.concatenate([mx.zeros((1, 1, x.shape[-1]), dtype=x.dtype), gate.reshape(1, 1, -1) * smeared_normed], axis=1)
+            bsz = x.shape[0]
+            x = x + mx.concatenate([mx.zeros((bsz, 1, x.shape[-1]), dtype=x.dtype), gate.reshape(1, 1, -1) * smeared_normed], axis=1)
         
         if self.bigram_hash is not None:
             bigram_emb = self.bigram_hash(input_ids[:, :-1], input_ids[:, 1:])
-            x = x + mx.concatenate([mx.zeros((1, 1, x.shape[-1]), dtype=x.dtype), bigram_emb], axis=1)
+            bsz = x.shape[0]
+            x = x + mx.concatenate([mx.zeros((bsz, 1, x.shape[-1]), dtype=x.dtype), bigram_emb], axis=1)
         
         x = rms_norm(x)
         x0 = x
