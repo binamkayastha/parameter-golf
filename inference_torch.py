@@ -296,7 +296,7 @@ def generate(model, sp, prompt: str, max_tokens: int = 100, temp: float = 0.0, t
     tokens = np.array(sp.encode(prompt), dtype=np.int64)
     x = torch.tensor(tokens.reshape(1, -1), dtype=torch.long)
     
-    for _ in range(max_tokens):
+    for i in range(max_tokens):
         logits = model.generate_logits(x)
         next_token_logits = logits[0, -1]
         
@@ -311,7 +311,11 @@ def generate(model, sp, prompt: str, max_tokens: int = 100, temp: float = 0.0, t
         else:
             next_token = torch.argmax(next_token_logits).item()
         
+        if i < 3:
+            print(f"DEBUG: step {i}, next_token={next_token}, top5 logits={torch.topk(next_token_logits, 5)}")
+        
         if next_token == sp.eos_id():
+            print(f"DEBUG: EOS token hit at step {i}")
             break
         
         x = torch.cat([x, torch.tensor([[next_token]], dtype=torch.long)], dim=1)
