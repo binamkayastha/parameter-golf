@@ -56,6 +56,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -66,6 +67,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 0))
+    mlp_act = os.environ.get("MLP_ACT", "relu2").strip().lower()
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -85,6 +88,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -604,17 +609,33 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    # Keep the original relu^2 path available while allowing a SwiGLU variant for 1-GPU runs.
+    def __init__(self, dim: int, mlp_mult: int, hidden: int = 0, act: str = "relu2"):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.act = act
+        hidden_dim = hidden if hidden > 0 else mlp_mult * dim
+        if hidden_dim <= 0:
+            raise ValueError(f"MLP hidden size must be positive, got {hidden_dim}")
+
+        if act == "relu2":
+            self.fc = CastedLinear(dim, hidden_dim, bias=False)
+            self.gate = None
+        elif act == "swiglu":
+            self.fc = CastedLinear(dim, hidden_dim, bias=False)
+            self.gate = CastedLinear(dim, hidden_dim, bias=False)
+        else:
+            raise ValueError(f"Unsupported MLP_ACT={act!r}; expected 'relu2' or 'swiglu'")
+
+        self.proj = CastedLinear(hidden_dim, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        value = self.fc(x)
+        if self.act == "relu2":
+            return self.proj(torch.relu(value).square())
+        if self.gate is None:
+            raise RuntimeError("SwiGLU path requires gate projection")
+        return self.proj(F.silu(self.gate(x)) * value)
 
 
 class Block(nn.Module):
@@ -624,6 +645,8 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_hidden: int,
+        mlp_act: str,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -631,7 +654,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, hidden=mlp_hidden, act=mlp_act)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -654,6 +677,8 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_hidden: int,
+        mlp_act: str,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -666,6 +691,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mlp_act = mlp_act
+        self.mlp_hidden = mlp_hidden if mlp_hidden > 0 else mlp_mult * model_dim
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -678,6 +705,8 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
+                    self.mlp_hidden,
+                    self.mlp_act,
                     rope_base,
                     qk_gain_init,
                 )
@@ -745,9 +774,15 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    default_grad_accum_steps = 8 // world_size if 8 % world_size == 0 else 1
+    if args.grad_accum_steps > 0:
+        grad_accum_steps = args.grad_accum_steps
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so default grad_accum_steps stays integral")
+        grad_accum_steps = default_grad_accum_steps
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -830,6 +865,8 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_hidden=args.mlp_hidden,
+        mlp_act=args.mlp_act,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -897,6 +934,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"mlp:act:{args.mlp_act} hidden:{base_model.mlp_hidden}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -908,6 +946,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"ema:enabled:{args.ema_enabled} decay:{args.ema_decay:.6f}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -959,6 +998,12 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    ema_state = (
+        {name: tensor.detach().float().clone() for name, tensor in base_model.state_dict().items()}
+        if args.ema_enabled
+        else None
+    )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1031,6 +1076,10 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state is not None:
+            with torch.no_grad():
+                for name, tensor in base_model.state_dict().items():
+                    ema_state[name].mul_(args.ema_decay).add_(tensor.detach().float(), alpha=1.0 - args.ema_decay)
         zero_grad_all()
 
         step += 1
@@ -1058,6 +1107,33 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if ema_state is not None:
+        log0("ema:applying shadow weights")
+        ema_model_state = {
+            name: tensor.to(dtype=base_model.state_dict()[name].dtype)
+            for name, tensor in ema_state.items()
+        }
+        base_model.load_state_dict(ema_model_state, strict=True)
+        torch.cuda.synchronize()
+        t_ema_eval = time.perf_counter()
+        ema_val_loss, ema_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"post_ema val_loss:{ema_val_loss:.4f} val_bpb:{ema_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ema_eval):.0f}ms"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
